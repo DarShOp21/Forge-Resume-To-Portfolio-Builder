@@ -1,0 +1,150 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  directUrl = env("DIRECT_DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// AUTH
+// ─────────────────────────────────────────────────────────────────────────
+
+enum AuthProvider {
+  LOCAL
+  GOOGLE
+  GITHUB
+}
+
+model User {
+  id           String       @id @default(uuid())
+  username     String       @unique @db.VarChar(30)
+  email        String       @unique @db.VarChar(255)
+  // Nullable so OAuth-only accounts (no local password) fit the same table.
+  passwordHash String?      @map("password_hash")
+  authProvider AuthProvider @default(LOCAL) @map("auth_provider")
+
+  emailVerifiedAt DateTime? @map("email_verified_at")
+  lastLoginAt     DateTime? @map("last_login_at")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  refreshTokens RefreshToken[]
+  runs          Run[]
+
+  @@map("users")
+}
+
+// One row per issued refresh token, so a single token can be revoked
+// (logout, "log out everywhere", password change) without invalidating
+// every session, and so you can see active sessions per device.
+model RefreshToken {
+  id        String    @id @default(uuid())
+  userId    String    @map("user_id")
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Store a hash, never the raw token (same reason you hash passwords).
+  tokenHash String    @unique @map("token_hash")
+  userAgent String?   @map("user_agent")
+  ipAddress String?   @map("ip_address")
+
+  expiresAt DateTime  @map("expires_at")
+  revokedAt DateTime? @map("revoked_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// PORTFOLIO GENERATION RUNS
+// ─────────────────────────────────────────────────────────────────────────
+
+// Coarse status - what the frontend filters/badges on.
+enum RunStatus {
+  QUEUED
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELED
+}
+
+// Fine-grained pipeline step - mirrors trigger/parent.ts exactly, so a
+// stage task can report "which step am I in" without inventing new names.
+// Only meaningful while status = RUNNING (or as the failure point when
+// status = FAILED); null while QUEUED and while terminal-successful.
+enum RunStage {
+  EXTRACTING_TEXT
+  PARSING_RESUME
+  ARCHITECTING
+  BLUEPRINTING
+  GENERATING_HTML
+  GENERATING_CSS
+  GENERATING_JS
+  VALIDATING
+  BUILDING
+  DEPLOYING
+}
+
+model Run {
+  // Our own id - generated *before* calling websiteTask.trigger(), and
+  // passed into the task payload as `runId` so every trigger.dev task can
+  // update this row directly instead of the API re-querying trigger.dev's
+  // own run object on every poll. This is what the frontend polls against.
+  id String @id @default(uuid())
+
+  userId String @map("user_id")
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // trigger.dev's own run id (the `handle.id` returned by `.trigger()`).
+  // Kept only for cross-referencing in the Trigger.dev dashboard/logs when
+  // debugging - not used for status polling once RunEvent rows exist.
+  triggerRunId String? @unique @map("trigger_run_id")
+
+  resumeUrl      String  @map("resume_url")
+  resumeFilename String? @map("resume_filename")
+
+  status         RunStatus @default(QUEUED)
+  stage          RunStage?
+  progressPercent Int      @default(0) @map("progress_percent")
+
+  deployedUrl        String? @map("deployed_url")
+  vercelDeploymentId String? @map("vercel_deployment_id")
+
+  errorMessage String?   @map("error_message")
+  errorStage   RunStage? @map("error_stage")
+
+  startedAt   DateTime? @map("started_at")
+  completedAt DateTime? @map("completed_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  events RunEvent[]
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([status])
+  @@map("runs")
+}
+
+// Append-only timeline. Each pipeline task writes one row when it starts
+// and one when it finishes/fails - gives you a stepper/log in the UI and a
+// debugging trail that survives even if the Trigger.dev run record expires.
+model RunEvent {
+  id     String @id @default(uuid())
+  runId  String @map("run_id")
+  run    Run    @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  stage    RunStage
+  // "started" | "succeeded" | "failed" | "warning"
+  status   String   @db.VarChar(20)
+  message  String?
+  // e.g. { "model": "inclusionai/ling-3.0-flash:free", "warnings": [...] }
+  metadata Json?
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([runId, createdAt])
+  @@map("run_events")
+}

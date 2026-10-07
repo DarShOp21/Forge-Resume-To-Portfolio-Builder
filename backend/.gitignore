@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.env
+.env.local
+.env.*.local
+
+# Pipeline output only — anchored so it does NOT also match
+# src/generated/ (that directory holds generated-but-committed skill
+# modules imported by src/skills/loader.ts).
+/generated/
+/output/
+
+*.log
+.trigger/
