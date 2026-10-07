@@ -68,7 +68,7 @@ export const AI_LIMITS: Record<
 
   // Code generation stages - moderate output, low temperature for consistency
   html: { maxOutputTokens:30000, temperature: 0.2, timeoutMs: 1500_000 },
-  css: { maxOutputTokens: 30000, temperature: 0.2, timeoutMs: 1500_000 },
+  css: { maxOutputTokens: 50000, temperature: 0.2, timeoutMs: 2000_000 },
   js: { maxOutputTokens: 30000, temperature: 0.2, timeoutMs: 1500_000 },
 
   // Deterministic structured extraction - temperature 0, and a much shorter
