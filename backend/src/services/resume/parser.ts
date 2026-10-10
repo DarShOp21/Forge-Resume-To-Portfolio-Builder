@@ -47,11 +47,13 @@ export async function parseResume(text: string) {
     return result;
   } catch (error) {
     const endTime = Date.now();
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const errorStack = error instanceof Error ? error.stack : undefined;
     console.error("===== PARSE RESUME ERROR =====", {
-      error: error.message,
+      error: errorMessage,
       durationMs: endTime - startTime
     });
-    console.error("Error stack:", error.stack);
+    console.error("Error stack:", errorStack);
     throw error;
   }
 }

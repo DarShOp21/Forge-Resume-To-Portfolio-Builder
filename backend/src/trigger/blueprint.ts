@@ -25,25 +25,30 @@ function extractJsonObject(text: string): unknown {
 }
 
 /**
- * The model has been observed nesting theme/sections/featuredProject/
- * featuredExperience/hero *inside* "website" instead of as siblings of it
- * (fixed primarily via a clearer prompt - see prompts/blueprint.ts - but
- * kept here too as a cheap safety net since we deliberately don't reject on
- * shape mismatches anymore). If those fields are missing at the top level
- * but present under `website`, hoist them up before the sections check.
+ * Normalize older top-level fields into the website shape used by the
+ * current prompt and schema. Existing nested values take precedence.
  */
 function repairWebsiteNesting(blueprint: any): any {
   if (!blueprint?.website || typeof blueprint.website !== "object") {
     return blueprint;
   }
 
-  const misnested = ["theme", "sections", "featuredProject", "featuredExperience", "hero"];
+  const misnested = ["theme", "sections", "hero"];
   const repaired = { ...blueprint, website: { ...blueprint.website } };
 
   for (const key of misnested) {
-    if (repaired[key] === undefined && repaired.website[key] !== undefined) {
-      repaired[key] = repaired.website[key];
+    if (repaired.website[key] === undefined && repaired[key] !== undefined) {
+      repaired.website[key] = repaired[key];
+      delete repaired[key];
+    }
+  }
+
+  for (const key of ["featuredProject", "featuredExperience"]) {
+    const value = repaired.website[key] ?? repaired[key];
+    if (repaired.website.content?.[key] === undefined && value !== undefined) {
+      repaired.website.content = { ...repaired.website.content, [key]: value };
       delete repaired.website[key];
+      delete repaired[key];
     }
   }
 
@@ -53,27 +58,10 @@ function repairWebsiteNesting(blueprint: any): any {
 /**
  * Runs after architectTask.
  *
- * DELIBERATELY NO SCHEMA VALIDATION HERE, BY REQUEST:
- * Earlier this task ran the model's output through
- * `blueprintSchema.safeParse(...)` and threw if it didn't match - that's
- * what was showing up as "Blueprint returned output that failed schema
- * validation" and blocking the run. This version just extracts the JSON
- * object and passes it straight through as `Blueprint`, unvalidated.
- *
- * What that trade-off actually means: `Blueprint` is still the Zod-inferred
- * TypeScript type for editor/compile-time purposes, but nothing at runtime
- * guarantees the object actually matches it anymore - a missing field, a
- * style value outside the enum, or a wrong type will now surface later, as
- * a less obvious failure in html/css/js generation (e.g. `blueprint.theme
- * .primaryColor` being undefined) instead of failing clearly and early
- * here. If that starts happening, the fix isn't to re-add
- * `blueprintSchema.safeParse` blindly (that's the behavior you just asked
- * to remove) - it's to make the *prompt* reliably produce the right shape
- * (tighter formatting instructions, a model with better native JSON/tool-
- * calling support) and validate again once it does, or to add narrow,
- * non-blocking checks for only the fields that matter most (e.g. `sections`
- * being a non-empty array, which is still checked below since without it
- * there's nothing to render).
+ * Keep model-output handling permissive: extract JSON and normalize legacy
+ * nesting, then require a non-empty website.sections array rather than full
+ * schema validation. Blueprint remains the schema-inferred compile-time
+ * type; other fields are not guaranteed to match it at runtime.
  */
 export const blueprintTask = task({
   id: "blueprint-task",
@@ -122,7 +110,7 @@ export const blueprintTask = task({
     // Not schema validation - just enough of a sanity check that there's
     // something to render. See the comment above for why this stops here
     // rather than re-introducing full validation.
-    if (!Array.isArray(blueprint?.sections) || blueprint.sections.length === 0) {
+    if (!Array.isArray(blueprint?.website?.sections) || blueprint.website.sections.length === 0) {
       logger.error("Blueprint has no sections - nothing to render", {
         rawOutput: rawContent,
       });

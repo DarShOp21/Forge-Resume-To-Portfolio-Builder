@@ -100,7 +100,7 @@ export const architectTask = task({
       );
     }
 
-    const plan: Architecture = result.parsed;
+    const plan: Architecture = architectureSchema.parse(result.parsed);
 
     if (!plan.pages?.length) {
       throw new Error("Architecture has no pages - nothing to generate.");

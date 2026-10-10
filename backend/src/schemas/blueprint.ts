@@ -99,5 +99,5 @@ export const blueprintSchema = z.object({
   }),
 });
 
-export type WebsiteBlueprint =
-  z.infer<typeof WebsiteBlueprintSchema>;
+export type BlueprintSchemaType = z.infer<typeof blueprintSchema>;
+export type WebsiteBlueprint = BlueprintSchemaType;

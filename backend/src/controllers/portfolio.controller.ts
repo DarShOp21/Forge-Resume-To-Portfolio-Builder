@@ -112,7 +112,10 @@ export async function generatePortfolio(req: Request, res: Response) {
     });
   } catch (error) {
     console.error("===== BUILD ERROR =====", error);
-    console.error("Error stack:", error.stack);
+    console.error(
+      "Error stack:",
+      error instanceof Error ? error.stack : undefined
+    );
     return res.status(500).json({
       message: "Failed to generate portfolio",
       error: error instanceof Error ? error.message : "Internal Server Error",
@@ -121,7 +124,13 @@ export async function generatePortfolio(req: Request, res: Response) {
 }
 
 export async function getPortfolioStatus(req: Request, res: Response) {
-  const run = await db.run.findUnique({ where: { id: req.params.runId } });
+  const { runId } = req.params;
+
+  if (typeof runId !== "string") {
+    return res.status(404).json({ message: "Run not found" });
+  }
+
+  const run = await db.run.findUnique({ where: { id: runId } });
 
   if (!run) {
     return res.status(404).json({ message: "Run not found" });

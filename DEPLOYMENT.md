@@ -5,7 +5,7 @@ Complete deployment instructions for the Forge Portfolio Builder using **free-ti
 ## 🏗️ Architecture Overview
 
 ```
-Frontend (Vercel)  →  Backend API (Vercel Serverless / Render)  →  Neon PostgreSQL
+Frontend (Vercel/Render Static Site)  →  Backend API (Render)  →  Neon PostgreSQL
                                             ↓
                                    Trigger.dev (Background Tasks)
                                             ↓
@@ -19,7 +19,8 @@ Frontend (Vercel)  →  Backend API (Vercel Serverless / Render)  →  Neon Post
 - GitHub account (for Vercel & Render Git integration)
 - NVIDIA API key (free tier: `nvapi-...` key from [build.nvidia.com](https://build.nvidia.com))
 - Neon account (free tier PostgreSQL)
-- Node.js 18+ (local build only)
+- Node.js 18+ (Node 22 is recommended for this repository)
+- Java 11+ wherever the backend processes resumes (`@opendataloader/pdf` launches Java)
 
 ---
 
@@ -41,10 +42,12 @@ cd backend
 npx prisma migrate dev --name init
 ```
 
-For production (after deploying the backend):
+For production, run the migration before the first backend request. On a free
+Render Web Service, use the migration in the Render build command shown below
+because Render's Pre-Deploy Command is not available on the Free plan:
 
 ```bash
-# Set DATABASE_URL in Vercel/Render env first, then:
+cd backend
 npx prisma migrate deploy
 ```
 
@@ -55,7 +58,9 @@ npx prisma migrate deploy
 1. Go to [build.nvidia.com](https://build.nvidia.com)
 2. Create an API key (free tier available)
 3. The key format is `nvapi-...`
-4. Set in all deployment env vars as `NVIDIA_API_KEY`
+4. Set it as `NVIDIA_API_KEY` for the diagnostic script and as
+   `OPENROUTER_API_KEY` for the backend/Trigger.dev runtime, which uses the
+   OpenAI-compatible NVIDIA endpoint configured in `src/tools/langchain.ts`
 
 ### Current Model Configuration
 
@@ -75,87 +80,273 @@ RESUME_MODEL=nvidia/nemotron-3-super-120b-a12b:free
 
 ---
 
-## 3️⃣ Frontend — Vercel (Free)
+## 3️⃣ Backend — Render Web Service (deploy this first)
+
+Deploy the backend before creating the frontend deployment. The backend URL is
+needed by the frontend, and the final frontend URL is needed by the backend's
+`FRONTEND_ORIGIN` CORS setting.
+
+### A. Prepare and verify locally
+
+Run these commands from the repository root before opening Render:
+
+```bash
+# Install the exact locked dependency tree and generate the Prisma client
+cd backend
+npm ci
+npx prisma generate
+
+# Apply the production migration only if DATABASE_URL points at the intended
+# database, then compile the TypeScript backend.
+# npx prisma migrate deploy
+npm run build
+
+# Start the same process Render will start
+npm start
+```
+
+`npm ci` also runs this repository's `postinstall` script, which runs
+`prisma generate`; the explicit command above makes that requirement visible.
+`npm run build` must finish with no TypeScript errors before deployment. The
+current source must be corrected if this command fails; Render stops at the
+build step and never starts the service.
+
+The backend listens on `process.env.PORT` and defaults to `3001` locally. Do
+not hard-code `PORT=3001` in Render; Render supplies the port automatically.
+
+### B. Create the Render service
+
+1. Push the repository to GitHub.
+2. Open [render.com](https://render.com) → **New** → **Web Service**.
+3. Connect the GitHub repository and select the branch to deploy.
+4. Use these settings:
+
+   | Render setting | Value |
+   |---|---|
+   | Runtime | `Docker` (recommended; Node is valid only when Java 11+ is available) |
+   | Root Directory | `backend` |
+   | Build Command | `npm ci && npx prisma generate && npx prisma migrate deploy && npm run build` |
+   | Start Command | `npm start` |
+   | Instance Type | `Free` for testing/low traffic |
+   | Node version | Add `NODE_VERSION=22.22.0` as an environment variable |
+
+   With `Root Directory` set to `backend`, do **not** put `cd backend` in any
+   Render command. Render runs every command relative to that directory.
+   `npm ci` installs from `backend/package-lock.json`; `prisma migrate deploy`
+   applies the checked-in migration in `backend/prisma/migrations`; and
+   `npm run build` writes the compiled server to `backend/dist/`.
+
+   On a paid Render service, the preferred split is:
+
+   ```text
+   Build Command:     npm ci && npx prisma generate && npm run build
+   Pre-Deploy Command: npx prisma migrate deploy
+   Start Command:     npm start
+   ```
+
+   The Free plan does not provide a Pre-Deploy Command, so keep
+   `prisma migrate deploy` in the Free-plan Build Command.
+
+### C. Java requirement for PDF extraction
+
+`backend/src/services/pdf/extract.ts` uses `@opendataloader/pdf`, whose Node
+wrapper starts a Java process. Java is required when a user uploads a resume;
+it is not just a local-development dependency. Verify the service logs include
+Java 11+ before testing uploads.
+
+Render's native Node runtime does not list Java among its guaranteed tools. For
+reliable resume processing, deploy this service with the Render **Docker**
+runtime. Create `backend/Dockerfile` with:
+
+```dockerfile
+FROM node:22-bookworm-slim
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends openjdk-17-jre-headless \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY package*.json ./
+COPY prisma ./prisma
+RUN npm ci
+
+COPY tsconfig.json trigger.config.ts ./
+COPY src ./src
+RUN npm run build
+
+CMD ["sh", "-c", "npx prisma migrate deploy && npm start"]
+```
+
+For the Docker service, set **Root Directory** to `backend`, choose the
+**Docker** runtime, set **Dockerfile Path** to `Dockerfile`, leave Render's
+Build Command empty, and use the Dockerfile above. The Dockerfile installs
+dependencies, generates Prisma during `npm ci`, compiles the backend, applies
+migrations at startup, and starts the server. The Node-runtime settings above
+remain useful for a Render plan where Java 11+ has been installed and verified.
+
+### D. Render environment variables
+
+Add these variables before the first deploy because both Prisma migration and
+the production server need them. Use Render's secret fields for keys and
+passwords; never commit `backend/.env`.
+
+```env
+NODE_ENV=production
+
+# Neon: pooled URL for runtime queries, direct URL for Prisma migrations
+DATABASE_URL=postgresql://USER:PASSWORD@HOST-pooler.REGION.aws.neon.tech/DBNAME?sslmode=require
+DIRECT_DATABASE_URL=postgresql://USER:PASSWORD@HOST.REGION.aws.neon.tech/DBNAME?sslmode=require
+
+# Generate locally with:
+# node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"
+ACCESS_TOKEN_SECRET=replace-with-a-long-random-value
+
+# Exact frontend origin; temporarily use the expected Vercel URL if it is not
+# known yet, then replace it after the frontend is deployed.
+FRONTEND_ORIGIN=https://your-frontend.vercel.app
+
+# Hostname(s) only, comma-separated; no https:// and no path
+RESUME_STORAGE_HOSTS=your-bucket.r2.dev
+
+# The current backend uses ChatOpenAI with an OpenAI-compatible NVIDIA endpoint.
+OPENROUTER_BASE_URL=https://integrate.api.nvidia.com/v1
+OPENROUTER_API_KEY=nvapi-your-nvidia-key
+NVIDIA_API_KEY=nvapi-your-nvidia-key
+ARCHITECT_MODEL=nvidia/nemotron-3-super-120b-a12b:free
+BLUEPRINT_MODEL=nvidia/nemotron-3-super-120b-a12b:free
+CODE_MODEL=nvidia/nemotron-3-super-120b-a12b:free
+RESUME_MODEL=nvidia/nemotron-3-super-120b-a12b:free
+
+# Used by the API to trigger the deployed Trigger.dev task
+TRIGGER_SECRET_KEY=tr_prod_your-trigger-secret
+
+# Used by the Trigger.dev deploy task, which publishes generated sites
+VERCEL_TOKEN=vcp_your-vercel-token
+```
+
+`PORT` is intentionally omitted: Render sets it and `src/server.ts` reads it.
+`NIM_URL` is present in the example environment file, but the current runtime
+client reads `OPENROUTER_BASE_URL` and `OPENROUTER_API_KEY`; set the latter two
+for actual AI requests.
+
+Leave Render's **Health Check Path** empty. This API currently has no public
+`/health` route, and `/auth/me` intentionally returns `401` without a token;
+Render's default TCP health check is the correct check for the current code.
+
+### E. Deploy and verify the backend
+
+Click **Create Web Service**. After the first successful deploy, copy the
+service URL, for example `https://forge-backend.onrender.com`.
+
+```bash
+export BACKEND_URL=https://forge-backend.onrender.com
+
+# A 401 is expected without an access token and confirms that Express is live.
+curl -i "$BACKEND_URL/auth/me"
+
+# Confirm the Render service is using HTTPS and accepts the auth route.
+curl -i -X POST "$BACKEND_URL/auth/signup" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"deployment-check","email":"deployment-check@example.com","password":"change-this-password"}'
+```
+
+The signup request should return `201` once the database migration is applied.
+Delete the test account from Neon if it is not needed.
+
+### F. Deploy the Trigger.dev tasks after the API is live
+
+The Render API calls `websiteTask.trigger()`, while the long-running
+architecture/blueprint/code-generation/deploy tasks run on Trigger.dev. From
+the backend directory:
+
+```bash
+cd backend
+npm ci
+npx prisma generate
+npm run build
+npx trigger login
+npx trigger deploy --env prod --skip-sync-env-vars
+```
+
+In the Trigger.dev project environment, add the variables needed by the task
+runtime: `DATABASE_URL`, `DIRECT_DATABASE_URL`, `OPENROUTER_BASE_URL`,
+`OPENROUTER_API_KEY`, the four model variables, and `VERCEL_TOKEN`. The
+`project` value is already in `backend/trigger.config.ts`; no
+`TRIGGER_PROJECT_ID` variable is required by the current source. Keep the
+matching `TRIGGER_SECRET_KEY` in Render so the API can trigger the deployed
+tasks.
+
+### Important Render limitations
+
+- Free Web Services sleep after inactivity and can take about a minute to wake.
+- The filesystem is ephemeral. Generated portfolio files under `backend/generated/`
+  must not be treated as permanent storage; the database and deployed Vercel
+  URL are the durable records.
+- The PDF parser, NVIDIA endpoint, Neon database, Trigger.dev, and Vercel are
+  all external dependencies. Check Render and Trigger.dev logs when a pipeline
+  reaches a stage but does not complete.
+
+---
+
+## 4️⃣ Frontend — Vercel (deploy after the backend)
 
 ### Method A: Git Integration (Recommended)
 
-1. Push code to GitHub
-2. Go to [vercel.com](https://vercel.com) → Add New Project
-3. Import your repository
-4. Vercel auto-detects Vite + React
-5. **Build Settings:**
+1. Deploy the Render backend and Trigger.dev tasks first using section 3.
+2. Go to [vercel.com](https://vercel.com) → **Add New Project**.
+3. Import the same GitHub repository.
+4. Set **Root Directory** to `frontend`.
+5. Use these build settings:
    - Build Command: `npm run build`
    - Output Directory: `dist`
-   - Install Command: `npm install`
-6. **Environment Variables** (Frontend):
+   - Install Command: `npm ci`
+6. Add these frontend environment variables before deploying:
+   ```env
+   # Express backend URL obtained from Render section 3
+   VITE_SERVER_URL=https://forge-backend.onrender.com
+
+   # Upload worker URL; the returned hostname must be in RESUME_STORAGE_HOSTS
+   VITE_API_URL=https://your-upload-worker.your-subdomain.workers.dev
    ```
-   VITE_API_URL=https://your-backend-url.vercel.app
-   ```
-7. Click **Deploy**
+7. Click **Deploy** and copy the final Vercel URL.
+8. Return to Render and change `FRONTEND_ORIGIN` to that exact Vercel URL, then
+   redeploy/restart the backend.
+
+`VITE_SERVER_URL` is the backend URL used by `frontend/src/lib/api.ts`.
+`VITE_API_URL` is the separate upload-worker URL; it is not the Express
+backend URL.
 
 ### Method B: Vercel CLI
 
 ```bash
 cd frontend
-npm install -g vercel
+npm ci
+npm install --global vercel
 vercel login
 vercel --prod
 ```
 
-Follow prompts to link the project and set env vars.
+Set `VITE_SERVER_URL` and `VITE_API_URL` when Vercel prompts for environment
+variables. These values are embedded at build time, so redeploy after changing
+them.
 
 ### Vercel Free Tier Includes
+
 - Unlimited bandwidth
 - Serverless Functions
 - Custom domains
 - Automatic HTTPS
 
----
+### Cross-origin refresh-cookie requirement
 
-## 4️⃣ Backend — Vercel Serverless Functions (Free)
-
-### Setup
-
-1. In your Vercel project, add the backend:
-   - Root Directory: `backend`
-   - Build Command: `npm install && npx prisma generate && npm run build`
-   - Output Directory: `dist`
-   - Dev Command: `node dist/server.js`
-
-2. **Environment Variables** (Backend):
-   ```
-   PORT=3001
-   NODE_ENV=production
-   DATABASE_URL=your_neon_connection_string
-   DIRECT_DATABASE_URL=your_neon_direct_connection
-   ACCESS_TOKEN_SECRET=your_random_secret
-   RESUME_STORAGE_HOSTS=your-r2-hostname
-   NVIDIA_API_KEY=nvapi-...
-   NIM_URL=https://integrate.api.nvidia.com/v1
-   OPENROUTER_BASE_URL=https://integrate.api.nvidia.com/v1
-   OPENROUTER_API_KEY=your-nvidia-api-key
-   ARCHITECT_MODEL=nvidia/nemotron-3-super-120b-a12b:free
-   BLUEPRINT_MODEL=nvidia/nemotron-3-super-120b-a12b:free
-   CODE_MODEL=nvidia/nemotron-3-super-120b-a12b:free
-   RESUME_MODEL=nvidia/nemotron-3-super-120b-a12b:free
-   FRONTEND_ORIGIN=https://your-frontend-url.vercel.app
-   ```
-
-### Alternative: Render.com (Free Tier)
-
-1. Go to [render.com](https://render.com) → New Web Service
-2. Connect GitHub repo
-3. **Settings:**
-   - Build Command: `cd backend && npm install && npx prisma generate && npm run build`
-   - Start Command: `node dist/server.js`
-   - Instance: Free (shared CPU, spins down after inactivity)
-4. Add the same environment variables above
-
-### Important Notes for Free Tiers
-
-- **Vercel Serverless**: Cold start ~1-3s on free tier
-- **Render Free**: Spins down after 15 min inactivity, cold start ~10s
-- Both are suitable for development / low-traffic projects
+The backend uses an HTTP-only, secure refresh-token cookie and the frontend
+sends credentials. A Vercel domain and an `onrender.com` domain are different
+sites, while the current backend cookie is configured with `SameSite=Lax`.
+For reliable refresh sessions, use frontend/backend custom domains under the
+same site, or update the cookie configuration in
+`backend/src/controllers/auth.controller.ts` to `sameSite: "none"` with
+`secure: true` and redeploy the backend. CORS must still use the exact
+frontend origin.
 
 ---
 
@@ -163,14 +354,25 @@ Follow prompts to link the project and set env vars.
 
 ### Option A: Trigger.dev Cloud (Free Tier)
 
-1. Go to [trigger.dev](https://trigger.dev) → Sign up
-2. Create a new project → Copy the **Project ID**
-3. Set env vars:
-   ```
-   TRIGGER_PROJECT_ID=proj_your-project-id
-   TRIGGER_SECRET_KEY=sk_tf_...
-   ```
-4. The `trigger.config.ts` is already configured:
+The Trigger.dev project reference is already configured in
+`backend/trigger.config.ts`. Sign in with the CLI, add the task environment
+variables in the Trigger.dev dashboard, and deploy the task bundle:
+
+```bash
+cd backend
+npm ci
+npx prisma generate
+npm run build
+npx trigger login
+npx trigger deploy --env prod --skip-sync-env-vars
+```
+
+Set `DATABASE_URL`, `DIRECT_DATABASE_URL`, `OPENROUTER_BASE_URL`,
+`OPENROUTER_API_KEY`, `ARCHITECT_MODEL`, `BLUEPRINT_MODEL`, `CODE_MODEL`,
+`RESUME_MODEL`, and `VERCEL_TOKEN` in the Trigger.dev project environment.
+Keep the matching `TRIGGER_SECRET_KEY` in the Render Web Service environment.
+
+The `trigger.config.ts` is already configured:
    ```typescript
    export default defineConfig({
      project: "proj_beofqrqhzbhglsiqvgaq",
@@ -211,34 +413,44 @@ The pipeline tasks are in `backend/src/trigger/`:
 ### Local Build Test (Before Deploying)
 
 ```bash
-# Build backend
+# Install, generate Prisma, and build backend
 cd backend
+npm ci
+npx prisma generate
 npm run build
-node dist/server.js  # Should start on port 3001
+npm start  # Should start on Render's PORT, or 3001 locally
 
 # Build frontend
 cd ../frontend
+npm ci
 npm run build
 npm run preview  # Should serve on port 4173
 ```
 
+The backend build must exit successfully before pushing a Render deploy. The
+current checkout reports TypeScript errors from `npm run build`; fix those
+errors first because Render will stop during its build command and will not
+start the backend.
+
 ### Deploy Order
 
 1. ✅ **Neon Database** — Create project, get connection string
-2. ✅ **Backend** — Deploy to Vercel/Render, set all env vars
-3. ✅ **Frontend** — Deploy to Vercel, set `VITE_API_URL`
-4. ✅ **Trigger.dev** — Configure runner (cloud or self-hosted)
-5. ✅ **Test Pipeline** — Upload resume → Verify full generation
+2. ✅ **Backend** — Deploy the API to Render and run the Prisma migration
+3. ✅ **Trigger.dev** — Deploy the background tasks and set task env vars
+4. ✅ **Frontend** — Deploy to Vercel after obtaining the Render URL
+5. ✅ **Backend CORS** — Set the final `FRONTEND_ORIGIN` and redeploy Render
+6. ✅ **Test Pipeline** — Sign up → upload resume → verify full generation
 
 ### Post-Deploy Verification
 
 ```bash
-# Test backend health
-curl https://your-backend.vercel.app/auth/me
+# Test backend reachability; 401 is expected without an access token
+curl -i https://your-backend.onrender.com/auth/me
 
 # Test portfolio generation (requires auth)
-curl -X POST https://your-backend.vercel.app/api/portfolio/generate \
+curl -X POST https://your-backend.onrender.com/api/portfolio/generate \
   -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
   -d '{"resumeUrl":"https://your-r2-storage/resume.pdf"}'
 ```
 
@@ -250,20 +462,20 @@ curl -X POST https://your-backend.vercel.app/api/portfolio/generate \
 
 | Variable | Description | Example |
 |---|---|---|
-| `PORT` | Server port | `3001` |
+| `NODE_ENV` | Runtime mode | `production` |
+| `PORT` | Render-injected server port; omit on Render | `3001` locally |
 | `DATABASE_URL` | Neon PostgreSQL connection | `postgresql://...` |
 | `DIRECT_DATABASE_URL` | Direct DB connection | `postgresql://...` |
 | `ACCESS_TOKEN_SECRET` | JWT signing secret | `your-random-string` |
-| `NVIDIA_API_KEY` | NVIDIA API key | `nvapi-...` |
-| `NIM_URL` | NVIDIA NIM endpoint | `https://integrate.api.nvidia.com/v1` |
-| `OPENROUTER_BASE_URL` | AI gateway URL | `https://integrate.api.nvidia.com/v1` |
-| `OPENROUTER_API_KEY` | AI gateway key | Same as NVIDIA_API_KEY |
+| `FRONTEND_ORIGIN` | Exact frontend origin for CORS | `https://your-frontend.vercel.app` |
+| `RESUME_STORAGE_HOSTS` | Allowed resume hostnames only | `your-bucket.r2.dev` |
+| `OPENROUTER_BASE_URL` | OpenAI-compatible AI endpoint | `https://integrate.api.nvidia.com/v1` |
+| `OPENROUTER_API_KEY` | AI endpoint key | Same as NVIDIA_API_KEY |
+| `NVIDIA_API_KEY` | NVIDIA key used by the diagnostic script | `nvapi-...` |
 | `ARCHITECT_MODEL` | Architect model ID | `nvidia/nemotron-3-super-120b-a12b:free` |
 | `BLUEPRINT_MODEL` | Blueprint model ID | `nvidia/nemotron-3-super-120b-a12b:free` |
 | `CODE_MODEL` | Code generation model | `nvidia/nemotron-3-super-120b-a12b:free` |
 | `RESUME_MODEL` | Resume parsing model | `nvidia/nemotron-3-super-120b-a12b:free` |
-| `FRONTEND_ORIGIN` | Frontend URL | `https://your-frontend.vercel.app` |
-| `RESUME_STORAGE_HOSTS` | Allowed resume hosts | `your-r2-hostname` |
 | `TRIGGER_SECRET_KEY` | Trigger.dev secret | `tr_dev_...` |
 | `VERCEL_TOKEN` | Vercel deployment token | `vcp_...` |
 
@@ -271,7 +483,8 @@ curl -X POST https://your-backend.vercel.app/api/portfolio/generate \
 
 | Variable | Description |
 |---|---|
-| `VITE_API_URL` | Backend URL |
+| `VITE_SERVER_URL` | Render backend URL |
+| `VITE_API_URL` | Resume upload worker URL |
 
 ---
 
@@ -283,7 +496,7 @@ curl -X POST https://your-backend.vercel.app/api/portfolio/generate \
 | **Neon PostgreSQL** | 0.5GB storage | Adequate for small apps |
 | **NVIDIA NIM** | Free tier credits | Check build.nvidia.com for limits |
 | **Trigger.dev** | Free tier | 10k runs/mo |
-| **Render** | Free (spins down) | Alternative to Vercel for backend |
+| **Render** | Free (spins down) | Backend Web Service |
 
 ---
 
@@ -292,8 +505,9 @@ curl -X POST https://your-backend.vercel.app/api/portfolio/generate \
 ### Common Issues
 
 1. **401 Authentication Error**
-   - Verify `NVIDIA_API_KEY` is set correctly
-   - Ensure `OPENROUTER_BASE_URL` points to NIM endpoint
+   - A `401` from `GET /auth/me` without a token is expected and proves the API is running.
+   - For AI requests, verify `OPENROUTER_API_KEY` is set correctly
+   - Ensure `OPENROUTER_BASE_URL` points to the NVIDIA NIM endpoint
 
 2. **Timeout Errors**
    - Increase `timeoutMs` in `backend/src/config/ai.ts`
@@ -301,7 +515,8 @@ curl -X POST https://your-backend.vercel.app/api/portfolio/generate \
 
 3. **Database Connection**
    - Verify `DATABASE_URL` includes `?sslmode=require`
-   - Run `npx prisma migrate deploy` after setting env
+   - Verify `DIRECT_DATABASE_URL` is set for Prisma migrations
+   - Run `npx prisma migrate deploy` after setting both database env vars
 
 4. **CORS Errors**
    - Set `FRONTEND_ORIGIN` to your deployed frontend URL
@@ -309,22 +524,34 @@ curl -X POST https://your-backend.vercel.app/api/portfolio/generate \
 
 5. **Trigger.dev Tasks Not Running**
    - Verify `TRIGGER_SECRET_KEY` matches dashboard
-   - Check runner is connected to the project
+   - Confirm `npx trigger deploy --env prod` completed successfully
+   - Confirm the Trigger.dev task environment contains database, AI, and `VERCEL_TOKEN` vars
+
+6. **Render build fails**
+   - Run `cd backend && npm ci && npx prisma generate && npm run build` locally
+   - Fix every TypeScript error before redeploying; Render does not start a service with a failed build
+
+7. **Resume upload fails with `java: command not found`**
+   - Deploy the backend with the Docker runtime and the Java-enabled `backend/Dockerfile` in section 3C
+   - Java is required by `@opendataloader/pdf` at request time
+
+8. **Login works but the session disappears after refresh**
+   - Use frontend/backend custom domains under the same site, or apply the `SameSite=None` cookie change described in section 4
 
 ### Useful Commands
 
 ```bash
-# Check backend logs
-vercel logs your-project-name
+# Check Render backend logs
+# Use the Render Dashboard → your service → Logs
 
 # Check Trigger.dev runs
-npx trigger.dev list
+npx trigger list
 
 # Reset database
 npx prisma migrate reset --force
 
-# View project status
-npx trigger.dev status
+# View Trigger.dev project identity
+npx trigger whoami
 ```
 
 ---

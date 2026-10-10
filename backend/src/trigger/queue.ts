@@ -8,7 +8,7 @@ import { queue } from "@trigger.dev/sdk";
  * exceed that model's requests-per-minute limit; a paid model can raise this
  * for throughput.
  */
-export const aiQueue = queue({
+export const aiQueue: ReturnType<typeof queue> = queue({
   name: "ai-queue",
   concurrencyLimit: 2,
 });

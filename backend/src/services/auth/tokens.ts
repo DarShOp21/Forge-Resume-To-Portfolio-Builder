@@ -2,7 +2,7 @@ import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import { randomBytes, createHash } from "crypto";
 
-const ACCESS_TOKEN_SECRET = process.env.ACCESS_TOKEN_SECRET;
+const ACCESS_TOKEN_SECRET = process.env.ACCESS_TOKEN_SECRET ?? "";
 const ACCESS_TOKEN_TTL = "15m";
 const REFRESH_TOKEN_TTL_DAYS = 30;
 
